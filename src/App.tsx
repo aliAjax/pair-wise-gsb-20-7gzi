@@ -1,162 +1,171 @@
+import { useState } from "react";
 import "./styles.css";
+import { actions, useCore, useStore } from "./domain/store";
+import { Board } from "./components/Board";
+import { RegisterForm } from "./components/RegisterForm";
+import { BatchPanel } from "./components/BatchPanel";
+import { AnomalyPanel } from "./components/AnomalyPanel";
+import { VersionPanel } from "./components/VersionPanel";
+import { RecordModal } from "./components/RecordModal";
+import { exportSnapshot } from "./domain/versions";
+import { recordId } from "./domain/merge";
+import {
+  conflictingBatchPack,
+  futureSchemaPack,
+  offlinePackA,
+  offlinePackB,
+} from "./domain/seed";
 
-const project = {
-  "id": "hxwl-06",
-  "port": 5106,
-  "title": "显微镜玻片观察",
-  "subtitle": "样本、多倍率视野与染色观察记录库",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#4338ca",
-    "#0d9488",
-    "#db2777"
-  ],
-  "domain": "生物显微观察",
-  "users": [
-    "实验课教师",
-    "学生",
-    "实验管理员"
-  ],
-  "metrics": [
-    "样本数",
-    "视野记录",
-    "染色方法",
-    "重点结构"
-  ],
-  "filters": [
-    "植物组织",
-    "动物组织",
-    "微生物",
-    "血液涂片"
-  ],
-  "fields": [
-    "样本名称",
-    "样本类型",
-    "染色方式",
-    "放大倍数",
-    "观察结构",
-    "视野描述"
-  ],
-  "records": [
-    [
-      "洋葱表皮",
-      "植物组织",
-      "碘液",
-      "400x",
-      "细胞壁清晰，细胞核可见"
-    ],
-    [
-      "人血涂片",
-      "血液涂片",
-      "瑞氏染色",
-      "1000x",
-      "红细胞分布均匀"
-    ],
-    [
-      "草履虫",
-      "微生物",
-      "活体观察",
-      "200x",
-      "纤毛运动明显"
-    ]
-  ]
-};
+const TABS = [
+  { key: "board", label: "看板" },
+  { key: "register", label: "登记" },
+  { key: "batch", label: "染色批次" },
+  { key: "anomaly", label: "合并异常" },
+  { key: "version", label: "版本与导出" },
+] as const;
 
-const statusColors = ["status-ok", "status-watch", "status-danger"];
+type TabKey = (typeof TABS)[number]["key"];
 
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
-    </article>
-  );
-}
+export default function App() {
+  const store = useStore();
+  const core = useCore();
+  const [tab, setTab] = useState<TabKey>("board");
+  const [selected, setSelected] = useState<{ slideCode: string; batchCode: string } | null>(null);
 
-function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
+  const recCount = Object.keys(core.records).length;
+  const fieldCount = Object.values(core.records).reduce((n, r) => n + r.fields.length, 0);
+  const openAnomalies = core.anomalies.filter((a) => !a.resolved).length;
+  const needReview = Object.values(core.records).filter((r) => r.status === "reconfirm").length;
+
+  const doExport = () => {
+    const blob = new Blob([exportSnapshot(core)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `观察导出-v${store.repo.versions.length}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const demoConcurrent = () => {
+    // 两名教师基于同一版本同时点"复核通过"
+    const target = Object.values(core.records).find((r) => r.status === "confirmed");
+    if (!target) return;
+    const base = core.records[recordId(target.slideCode, target.batchCode)].version;
+    actions.submitReview(target.slideCode, target.batchCode, {
+      teacher: "王老师",
+      basis: "核形态正常、染色均匀，与教材图谱一致",
+      baseVersion: base,
+    });
+    setTimeout(() => {
+      actions.submitReview(target.slideCode, target.batchCode, {
+        teacher: "李老师",
+        basis: "细胞壁完整、未见破损（我的独立观察依据）",
+        baseVersion: base,
+      });
+    }, 50);
+  };
 
   return (
     <main className="app-shell">
       <section className="hero">
         <div>
-          <p className="eyebrow">{project.id} · port {project.port}</p>
-          <h1>{project.title}</h1>
-          <p className="subtitle">{project.subtitle}</p>
+          <p className="eyebrow">hxwl-06 · 离线优先显微观察记录</p>
+          <h1>显微镜玻片观察</h1>
+          <p className="subtitle">断网登记 → 恢复合并（同玻片同批次视野归并、后到不覆盖） · 批次失效 · 并发复核 · 版本同源</p>
         </div>
-        <div className="stack-card">
-          <span>技术栈</span>
-          <strong>{project.stack}</strong>
+        <div className="hero-actions">
+          <label className={`net-switch ${store.online ? "on" : "off"}`}>
+            <input
+              type="checkbox"
+              checked={store.online}
+              onChange={(e) => actions.setOnline(e.target.checked)}
+            />
+            <span className="dot" />
+            {store.online ? "在线" : "断网中"}
+          </label>
+          {store.queue.length > 0 && (
+            <button className="primary-action" onClick={actions.flushQueue}>
+              网络恢复 · 合并队列（{store.queue.length}）
+            </button>
+          )}
+          <button onClick={doExport}>按当前版本导出</button>
+          <button className="ghost" onClick={actions.resetAll}>重置演示</button>
         </div>
       </section>
 
       <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
+        <article className="metric-card">
+          <span>观察记录</span>
+          <strong>{recCount}</strong>
+          <i className="status-ok" />
+        </article>
+        <article className="metric-card">
+          <span>视野（已归并）</span>
+          <strong>{fieldCount}</strong>
+          <i className="status-watch" />
+        </article>
+        <article className="metric-card">
+          <span>待重新确认</span>
+          <strong>{needReview}</strong>
+          <i className={needReview ? "status-danger" : "status-ok"} />
+        </article>
+        <article className="metric-card">
+          <span>未处理异常</span>
+          <strong>{openAnomalies}</strong>
+          <i className={openAnomalies ? "status-danger" : "status-ok"} />
+        </article>
+        <article className="metric-card">
+          <span>离线队列</span>
+          <strong>{store.queue.length}</strong>
+          <i className={store.queue.length ? "status-watch" : "status-ok"} />
+        </article>
+      </section>
+
+      <nav className="tabs">
+        {TABS.map((t) => (
+          <button key={t.key} className={tab === t.key ? "active" : ""} onClick={() => setTab(t.key)}>
+            {t.label}
+            {t.key === "anomaly" && openAnomalies > 0 && <em className="badge">{openAnomalies}</em>}
+          </button>
         ))}
-      </section>
+        <span className="tab-spacer" />
+        <button className="ghost small" onClick={() => actions.enqueuePack(offlinePackA(), "2号镜台：同玻片重复400x+新增1000x")}>
+          模拟2号台登记
+        </button>
+        <button className="ghost small" onClick={() => actions.enqueuePack(offlinePackB(), "5号镜台：同玻片新增200x")}>
+          模拟5号台登记
+        </button>
+        <button className="ghost small" onClick={() => actions.enqueuePack(futureSchemaPack(), "高版本数据包")}>
+          模拟高版本包
+        </button>
+        <button className="ghost small" onClick={() => actions.enqueuePack(conflictingBatchPack(), "批次方法冲突包")}>
+          模拟冲突包
+        </button>
+        <button className="ghost small" onClick={demoConcurrent}>
+          双师同时复核
+        </button>
+      </nav>
 
-      <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
+      {tab === "board" && <Board onOpen={(s, b) => setSelected({ slideCode: s, batchCode: b })} />}
+      {tab === "register" && <RegisterForm />}
+      {tab === "batch" && <BatchPanel />}
+      {tab === "anomaly" && <AnomalyPanel />}
+      {tab === "version" && <VersionPanel />}
 
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
-      </section>
+      {selected && (
+        <RecordModal
+          slideCode={selected.slideCode}
+          batchCode={selected.batchCode}
+          onClose={() => setSelected(null)}
+        />
+      )}
 
-      <section className="records panel">
-        <div className="section-heading">
-          <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
-          </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+      <div className="toast-stack">
+        {store.toasts.map((t) => (
+          <div key={t.id} className={`toast ${t.kind}`}>{t.text}</div>
+        ))}
+      </div>
     </main>
   );
 }
-
-export default App;
